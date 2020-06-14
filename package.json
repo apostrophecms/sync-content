@@ -1,0 +1,25 @@
+{
+  "name": "apostrophe-backup",
+  "version": "1.0.0",
+  "description": "Back up and restore ApostropheCMS sites via the admin bar.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/apostrophecms/apostrophe-backup.git"
+  },
+  "author": "Apostrophe Technologies Inc.",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/apostrophecms/apostrophe-backup/issues"
+  },
+  "homepage": "https://github.com/apostrophecms/apostrophe-backup#readme",
+  "dependencies": {
+    "bson": "^4.0.4",
+    "bson-stream": "0.0.8",
+    "mkdirp": "^1.0.4",
+    "moment": "^2.26.0"
+  }
+}
