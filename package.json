@@ -20,6 +20,7 @@
     "bson": "^4.0.4",
     "bson-stream": "0.0.8",
     "mkdirp": "^1.0.4",
-    "moment": "^2.26.0"
+    "moment": "^2.26.0",
+    "tar-stream": "^2.1.2"
   }
 }
