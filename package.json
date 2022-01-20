@@ -1,0 +1,27 @@
+{
+  "name": "apostrophe-backup",
+  "version": "1.0.0",
+  "description": "Backup utility for apostrophe 2.x sites",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/apostrophecms/apostrophe-backup.git"
+  },
+  "keywords": [
+    "backup",
+    "apostrophecms"
+  ],
+  "author": "Apostrophe Technologies",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/apostrophecms/apostrophe-backup/issues"
+  },
+  "homepage": "https://github.com/apostrophecms/apostrophe-backup#readme",
+  "dependencies": {
+    "bson": "^4.6.1",
+    "unzipper": "^0.10.11"
+  }
+}
