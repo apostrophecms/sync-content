@@ -1,14 +1,14 @@
 {
-  "name": "apostrophe-backup",
+  "name": "@apostrophecms/sync-content",
   "version": "1.0.0",
-  "description": "Backup utility for apostrophe 2.x sites",
+  "description": "Content sync utility for ApostropheCMS sites",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/apostrophecms/apostrophe-backup.git"
+    "url": "git+https://github.com/apostrophecms/sync-content.git"
   },
   "keywords": [
     "backup",
@@ -17,9 +17,9 @@
   "author": "Apostrophe Technologies",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/apostrophecms/apostrophe-backup/issues"
+    "url": "https://github.com/apostrophecms/sync-content/issues"
   },
-  "homepage": "https://github.com/apostrophecms/apostrophe-backup#readme",
+  "homepage": "https://github.com/apostrophecms/sync-content#readme",
   "dependencies": {
     "bson": "^4.6.1",
     "unzipper": "^0.10.11"
