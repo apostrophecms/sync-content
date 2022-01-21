@@ -85,12 +85,16 @@ module.exports = {
           });
         });
       }
+      res.write(JSON.stringify({
+        'end': true
+      }));
       console.log('after last collection');
       res.end();
     });
     // Returns promise (awaitable)
     self.syncFrom = (envName) => {
       console.log(`** ${envName}`);
+      let ended = false;
       return new Promise(async (resolve, reject) => {
         const env = self.options.environments && self.options.environments[envName];
         if (!env) {
@@ -111,61 +115,97 @@ module.exports = {
           parser({
             jsonStreaming: true
           }),
-          streamValues(),
-          async (data) => {
-            console.log('datum');
-            const value = data.value;
-            if (!version) {
-              console.log('checking');
-              if (!(value && (value['@apostrophecms/sync-content'] === true))) {
-                throw 'This response does not contain an @apostrophecms/sync-content stream';
-              }
-              if (value.version !== 1) {
-                throw `This site does not support stream version ${value.version}`;
-              }
-              console.log('hmm');
-              version = value.version;
-              const never = [ 'aposUsersSafe', 'sessions', 'aposCache', 'aposLocks', 'aposNotifications', 'aposBlessings', 'aposDocVersions' ];
-              // Purge
-              const collections = (await self.apos.db.collections()).filter(collection => !collection.collectionName.match(/^system\./) && !never.includes(collection.collectionName));
-              console.log('purging');
+          streamValues()
+        ]);
+        // I should have been able to make handleObject the last entry
+        // in chain[], but in practice the sender stalled out every time.
+        // This should still provide backpressure because we only
+        // read() when we are ready
+        let writing = false;
+        pipeline.on('readable', async () => {
+          if (writing) {
+            console.error('HEY WTF!');
+          }
+          console.log('ruh roh readable!');
+          try {
+            let object;
+            // Use a loop to make sure we read all currently available data
+            while (null !== (object = pipeline.read())) {
+              writing = true;
+              await handleObject(object.value);
+              writing = false;
+            }
+          } catch (e) {
+            pipeline.destroy();
+            return reject(e);
+          }
+        });
+        pipeline.on('error', (e) => {
+          if (!ended) {
+            return reject(e);
+          }
+        });
+        async function handleObject(value) {
+          console.log(value);
+          if (!version) {
+            console.log('checking');
+            if (!(value && (value['@apostrophecms/sync-content'] === true))) {
+              throw 'This response does not contain an @apostrophecms/sync-content stream';
+            }
+            if (value.version !== 1) {
+              throw `This site does not support stream version ${value.version}`;
+            }
+            console.log('hmm');
+            version = value.version;
+            const never = [ 'aposUsersSafe', 'sessions', 'aposCache', 'aposLocks', 'aposNotifications', 'aposBlessings', 'aposDocVersions' ];
+            // Purge
+            const collections = (await self.apos.db.collections()).filter(collection => !collection.collectionName.match(/^system\./) && !never.includes(collection.collectionName));
+            console.log('purging:', collections.map(collection => collection.collectionName));
+            try {
               for (const collection of collections) {
-                console.log(`** ${collection.collectionName}`);
                 const criteria = (collection.collectionName === 'aposDocs') ? {
                   type: {
                     $nin: [ 'apostrophe-users', 'apostrophe-groups' ]
                   }
                 } : {};
+                console.log('removing:', criteria, 'from:', collection.collectionName);
                 await collection.removeMany(criteria);
+                console.log('after remove call');
+                console.log(await collection.countDocuments({}));
+                console.log('after count call');
               }
-              console.log('after purging');
-              console.log('ready for docs');
-            } else if (value.collection) {
-              if (!collections[value.collection]) {
-                collections[value.collection] = self.apos.db.collection(value.collection);
-              }
-              const collection = collections[value.collection];
-              await collection.replaceOne({
-                _id: value.doc._id
-              }, EJSON.parse(JSON.stringify(value.doc)), {
-                upsert: true
-              });
-            } else {
-              throw 'Unexpected object in JSON stream';
+            } catch (e) {
+              console.error('**', e);
+              throw e;
             }
+            console.log('after purging');
+            console.log('ready for docs');
+          } else if (value.collection) {
+            if (!collections[value.collection]) {
+              collections[value.collection] = self.apos.db.collection(value.collection);
+            }
+            const collection = collections[value.collection];
+            try {
+              value.doc = EJSON.parse(JSON.stringify(value.doc));
+              console.log(`*** ${value.doc._id}`);
+              console.log(collection.collectionName);
+              await collection.insertOne(
+                value.doc
+              );
+            } catch (e) {
+              console.error(JSON.stringify(value, null, '  '));
+              throw e;
+            }
+          } else if (value.end) {
+            ended = true;
+            console.log('ending');
+            return resolve();
+          } else {
+            throw 'Unexpected object in JSON stream';
           }
-        ]);
-        pipeline.on('end', () => {
-          console.log('end event');
-          if (!version) {
-            return reject('This response does not contain an @apostrophecms/sync-content stream');
-          }
-          console.log('resolving');
-          return resolve();
-        });
-        pipeline.on('error', (e) => {
-          return reject(e);
-        });
+          console.log('returning');
+          return true;
+        }
       });
     };
 
