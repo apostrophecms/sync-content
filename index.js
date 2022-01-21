@@ -9,7 +9,7 @@ const compression = require('compression');
 
 const { chain }  = require('stream-chain');
 const { parser } = require('stream-json');
-const { streamValues } = require('stream-json/streamers/StreamValues');
+const { stringer } = require('stream-json/Stringer');
 
 module.exports = {
   construct(self, options) {
@@ -45,7 +45,7 @@ module.exports = {
       // Ask nginx not to buffer this large response, better that it
       // flow continuously to the other end
       res.setHeader('X-Accel-Buffering', 'no');
-      res.write(JSON.stringify({
+      res.write(EJSON.stringify({
         '@apostrophecms/sync-content': true,
         version: 1
       }));
@@ -108,12 +108,12 @@ module.exports = {
         const collections = {};
         const pipeline = chain([
           response.body,
-          parser({
-            jsonStreaming: true
-          }),
-          streamValues(),
+          parser(),
+          stringer(),
           async (data) => {
             console.log('datum');
+            console.log(`** ${data}`);
+            return;
             const value = data.value;
             if (!version) {
               console.log('checking');
@@ -147,11 +147,11 @@ module.exports = {
               const collection = collections[value.collection];
               await collection.replaceOne({
                 _id: value.doc._id
-              }, EJSON.parse(JSON.stringify(value.doc.data)), {
+              }, value.doc.data, {
                 upsert: true
               });
             } else {
-              throw 'Unexpected object in JSON stream';
+              throw 'Unexpected object in EJSON stream';
             }
           }
         ]);
