@@ -39,11 +39,13 @@ require('apostrophe')({
     '@apostrophecms/sync-content': {
       // Our API key, for incoming sync requests
       apiKey: 'choose-a-very-secure-random-key',
-      staging: {
-        label: 'Staging',
-        url: 'https://mysite.staging.mycompany.com',
-        // Their API key, for outgoing sync requests
-        apiKey: 'choose-a-very-secure-random-key'  
+      environments: {
+        staging: {
+          label: 'Staging',
+          url: 'https://mysite.staging.mycompany.com',
+          // Their API key, for outgoing sync requests
+          apiKey: 'choose-a-very-secure-random-key'  
+        }
       }
     }
   }
@@ -66,35 +68,32 @@ You will be given the option to include related documents, i.e. images and other
 
 ```bash
 # sync all content FROM this site, TO another environment.
-# If other content already exists, keep it
-node app @apostrophecms/sync-content:sync --to=staging
-# sync all content FROM this site, TO another environment.
 # If other content already exists, purge it
-node app @apostrophecms/sync-content:sync --to=staging --purge
-# sync all content TO this site, FROM another environment.
-# If other content already exists locally, keep it
-node app @apostrophecms/sync-content:sync --from=staging
+node app @apostrophecms/sync-content:sync --to=staging
 # sync all content TO this site, FROM another environment.
 # If other content already exists locally, purge it
-node app @apostrophecms/sync-content:sync --from=staging --purge
+node app @apostrophecms/sync-content:sync --from=staging
 # sync content of one piece type only, plus any related
-# documents
+# documents. If other content already exists locally, purge it
 node app @apostrophecms/sync-content:sync --from=staging --type=articles
+# Same, but keep other content of this type
+node app @apostrophecms/sync-content:sync --from=staging --type=articles --keep
 # sync content of one piece type only, without related documents
+# (may also be combined with --keep)
 node app @apostrophecms/sync-content:sync --from=staging --type=articles --without-related
 # skip media, for speed (you will see broken images)
 node app @apostrophecms/sync-content:sync --from=staging --skip-media
 ```
 
 * You must specify either `--from` or `--to` to specify the environment to sync with, as seen in your configuration above, where `staging` is an example.
-* You may specify `--purge` to **completely delete any content not included in the sync.** This is usually appropriate when syncing an entire site.
 * You may specify `--type=typename` to specify one content type only. This must be a piece type, and must match the `name` option of the type (**not** the module name, unless they are the same).
+* When using `--type`, you may also specify `--keep` to keep preexisting pieces whose `_id` does not appear in the synced content. **For data integrity reasons, this is not available when syncing an entire site.**
 * By default, syncing a piece type will also sync directly related documents, such as images found in that piece. If you do not want this, specify `--without-related`.
 * Actual media files, i.e. images, PDFs, etc., are always synced when using the UI. However on the command line you can skip this with `--skip-media`. **This will definitely result in broken images,** but is useful for quick tests.
 
 ### Security restrictions
 
-For security reasons, users and groups are **not** synced. You will have the same users and groups as before the sync operation.
+For security reasons, and to avoid chicken and egg problems when using the UI, users and groups are **not** synced. You will have the same users and groups as before the sync operation.
 
 To prevent unexpected outcomes, only admins can access the Sync button.
 
