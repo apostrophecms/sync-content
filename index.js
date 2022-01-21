@@ -147,7 +147,7 @@ module.exports = {
               const collection = collections[value.collection];
               await collection.replaceOne({
                 _id: value.doc._id
-              }, EJSON.parse(JSON.stringify(value.doc.data)), {
+              }, EJSON.parse(JSON.stringify(value.doc)), {
                 upsert: true
               });
             } else {
