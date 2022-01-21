@@ -8,7 +8,6 @@ const fetch = require('node-fetch');
 const compression = require('compression');
 const pipeline = require('util').promisify(require('stream').pipeline);
 const Stream = require('stream');
-const { chain }  = require('stream-chain');
 const { parser } = require('stream-json');
 const { streamValues } = require('stream-json/streamers/StreamValues');
 
