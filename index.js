@@ -6,14 +6,16 @@ const unzipper = require('unzipper');
 const unlink = util.promisify(fs.unlink);
 const fetch = require('node-fetch');
 const compression = require('compression');
-
+const pipeline = require('util').promisify(require('stream').pipeline);
+const Stream = require('stream');
 const { chain }  = require('stream-chain');
 const { parser } = require('stream-json');
 const { streamValues } = require('stream-json/streamers/StreamValues');
 
 module.exports = {
   construct(self, options) {
-    console.log(self.action);
+    self.neverCollections = [ 'aposUsersSafe', 'sessions', 'aposCache', 'aposLocks', 'aposNotifications', 'aposBlessings', 'aposDocVersions' ];
+    self.neverTypes = [ 'apostrophe-user', 'apostrophe-group' ];
     self.apos.on('csrfExceptions', function(list) {
       list.push(`${self.action}/content`);
     });
@@ -22,7 +24,6 @@ module.exports = {
       if (!peer) {
         throw 'You must specify either --from or --to.';
       }
-      console.log(argv);
       if (argv.from && argv.to) {
         throw 'You must not specify both --from and --to (one end is always local).';
       }
@@ -49,7 +50,7 @@ module.exports = {
         '@apostrophecms/sync-content': true,
         version: 1
       }));
-      const never = [ 'aposUsersSafe', 'sessions', 'aposCache', 'aposDocVersions' ];
+      const never = self.neverCollections;
       const collections = (await self.apos.db.collections()).filter(collection => {
         if (collection.collectionName.match(/^system\./)) {
           return false;
@@ -60,10 +61,9 @@ module.exports = {
         return true;
       });
       for (const collection of collections) {
-        console.log(`** ${collection.collectionName}`);
         const criteria = (collection.collectionName === 'aposDocs') ? {
           type: {
-            $nin: [ 'apostrophe-users', 'apostrophe-groups' ]
+            $nin: self.neverTypes
           }
         } : {};
         await self.apos.migrations.each(collection, criteria, doc => {
@@ -75,10 +75,8 @@ module.exports = {
             if (sent) {
               resolve();
             } else {
-              console.log('draining');
               // Keep draining when the buffer is full to avoid using too much RAM
               res.once('drain', () => {
-                console.log('drained');
                 resolve();
               });
             }
@@ -88,125 +86,93 @@ module.exports = {
       res.write(JSON.stringify({
         'end': true
       }));
-      console.log('after last collection');
       res.end();
     });
     // Returns promise (awaitable)
-    self.syncFrom = (envName) => {
-      console.log(`** ${envName}`);
+    self.syncFrom = async (envName) => {
       let ended = false;
-      return new Promise(async (resolve, reject) => {
-        const env = self.options.environments && self.options.environments[envName];
-        if (!env) {
-          throw new Error(`${envName} does not appear as a subproperty of the environments option`);
-        }
-        const response = await fetch(`${env.url}/modules/@apostrophecms/sync-content/content`, {
-          headers: {
-            'Authorization': `ApiKey ${env.apiKey}`
-          }
-        });
-        if (response.status >= 400) {
-          throw await response.text();
-        }
-        let version = null;
-        const collections = {};
-        const pipeline = chain([
-          response.body,
-          parser({
-            jsonStreaming: true
-          }),
-          streamValues()
-        ]);
-        // I should have been able to make handleObject the last entry
-        // in chain[], but in practice the sender stalled out every time.
-        // This should still provide backpressure because we only
-        // read() when we are ready
-        let writing = false;
-        pipeline.on('readable', async () => {
-          if (writing) {
-            console.error('HEY WTF!');
-          }
-          console.log('ruh roh readable!');
-          try {
-            let object;
-            // Use a loop to make sure we read all currently available data
-            while (null !== (object = pipeline.read())) {
-              writing = true;
-              await handleObject(object.value);
-              writing = false;
-            }
-          } catch (e) {
-            pipeline.destroy();
-            return reject(e);
-          }
-        });
-        pipeline.on('error', (e) => {
-          if (!ended) {
-            return reject(e);
-          }
-        });
-        async function handleObject(value) {
-          console.log(value);
-          if (!version) {
-            console.log('checking');
-            if (!(value && (value['@apostrophecms/sync-content'] === true))) {
-              throw 'This response does not contain an @apostrophecms/sync-content stream';
-            }
-            if (value.version !== 1) {
-              throw `This site does not support stream version ${value.version}`;
-            }
-            console.log('hmm');
-            version = value.version;
-            const never = [ 'aposUsersSafe', 'sessions', 'aposCache', 'aposLocks', 'aposNotifications', 'aposBlessings', 'aposDocVersions' ];
-            // Purge
-            const collections = (await self.apos.db.collections()).filter(collection => !collection.collectionName.match(/^system\./) && !never.includes(collection.collectionName));
-            console.log('purging:', collections.map(collection => collection.collectionName));
-            try {
-              for (const collection of collections) {
-                const criteria = (collection.collectionName === 'aposDocs') ? {
-                  type: {
-                    $nin: [ 'apostrophe-users', 'apostrophe-groups' ]
-                  }
-                } : {};
-                console.log('removing:', criteria, 'from:', collection.collectionName);
-                await collection.removeMany(criteria);
-                console.log('after remove call');
-                console.log(await collection.countDocuments({}));
-                console.log('after count call');
-              }
-            } catch (e) {
-              console.error('**', e);
-              throw e;
-            }
-            console.log('after purging');
-            console.log('ready for docs');
-          } else if (value.collection) {
-            if (!collections[value.collection]) {
-              collections[value.collection] = self.apos.db.collection(value.collection);
-            }
-            const collection = collections[value.collection];
-            try {
-              value.doc = EJSON.parse(JSON.stringify(value.doc));
-              console.log(`*** ${value.doc._id}`);
-              console.log(collection.collectionName);
-              await collection.insertOne(
-                value.doc
-              );
-            } catch (e) {
-              console.error(JSON.stringify(value, null, '  '));
-              throw e;
-            }
-          } else if (value.end) {
-            ended = true;
-            console.log('ending');
-            return resolve();
-          } else {
-            throw 'Unexpected object in JSON stream';
-          }
-          console.log('returning');
-          return true;
+      const env = self.options.environments && self.options.environments[envName];
+      if (!env) {
+        throw new Error(`${envName} does not appear as a subproperty of the environments option`);
+      }
+      const response = await fetch(`${env.url}/modules/@apostrophecms/sync-content/content`, {
+        headers: {
+          'Authorization': `ApiKey ${env.apiKey}`
         }
       });
+      if (response.status >= 400) {
+        throw await response.text();
+      }
+      let version = null;
+      const collections = {};
+      
+      const sink = new Stream.Writable({
+        objectMode: true
+      });
+      sink._write = async (value, encoding, callback) => {
+        try {
+          await handleObject(value);
+          return callback(null);
+        } catch (e) {
+          return callback(e);
+        }
+      };
+
+      await pipeline(
+        response.body,
+        parser({
+          jsonStreaming: true
+        }),
+        streamValues(),
+        sink
+      );
+
+      if (!ended) {
+        throw 'Incomplete stream';
+      }
+
+      async function handleObject(value) {
+        value = value.value;
+        if (!version) {
+          if (!(value && (value['@apostrophecms/sync-content'] === true))) {
+            throw 'This response does not contain an @apostrophecms/sync-content stream';
+          }
+          if (value.version !== 1) {
+            throw `This site does not support stream version ${value.version}`;
+          }
+          version = value.version;
+          const never = self.neverCollections;
+          // Purge
+          const collections = (await self.apos.db.collections()).filter(collection => !collection.collectionName.match(/^system\./) && !never.includes(collection.collectionName));
+          for (const collection of collections) {
+            const criteria = (collection.collectionName === 'aposDocs') ? {
+              type: {
+                $nin: self.neverTypes
+              }
+            } : {};
+            await collection.removeMany(criteria);
+          }
+        } else if (value.collection) {
+          if (!collections[value.collection]) {
+            collections[value.collection] = self.apos.db.collection(value.collection);
+          }
+          const collection = collections[value.collection];
+          try {
+            value.doc = EJSON.parse(JSON.stringify(value.doc));
+            await collection.insertOne(
+              value.doc
+            );
+          } catch (e) {
+            console.error(JSON.stringify(value, null, '  '));
+            throw e;
+          }
+        } else if (value.end) {
+          ended = true;
+        } else {
+          throw 'Unexpected object in JSON stream';
+        }
+        return true;
+      }
     };
 
       // return new Promise(async (resolve, reject) => {
