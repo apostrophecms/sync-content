@@ -10,13 +10,16 @@ const pipeline = require('util').promisify(require('stream').pipeline);
 const Stream = require('stream');
 const { parser } = require('stream-json');
 const { streamValues } = require('stream-json/streamers/StreamValues');
+const qs = require('qs');
 
 module.exports = {
   construct(self, options) {
     self.neverCollections = [ 'aposUsersSafe', 'sessions', 'aposCache', 'aposLocks', 'aposNotifications', 'aposBlessings', 'aposDocVersions' ];
     self.neverTypes = [ 'apostrophe-user', 'apostrophe-group' ];
     self.apos.on('csrfExceptions', function(list) {
+      // For syncTo and the POST routes
       list.push(`${self.action}/content`);
+      list.push(`${self.action}/uploadfs`);
     });
     self.addTask('sync', 'Syncs content to or from another server environment', async (apos, argv) => {
       const peer = argv.from || argv.to;
@@ -35,65 +38,99 @@ module.exports = {
     self.route('get', 'content', compression({
       filter: (req) => true
     }), async (req, res) => {
-      if (!self.options.apiKey) {
-        throw 'API key not configured';
-      }
-      const apiKey = getAuthorizationApiKey(req);
-      if (apiKey !== self.options.apiKey) {
-        throw 'Invalid API key';
-      }
-      // Ask nginx not to buffer this large response, better that it
-      // flow continuously to the other end
-      res.setHeader('X-Accel-Buffering', 'no');
-      res.write(JSON.stringify({
-        '@apostrophecms/sync-content': true,
-        version: 1
-      }));
-      const never = self.neverCollections;
-      const collections = (await self.apos.db.collections()).filter(collection => {
-        if (collection.collectionName.match(/^system\./)) {
-          return false;
+      try {
+        if (!self.options.apiKey) {
+          throw 'API key not configured';
         }
-        if (never.includes(collection.collectionName)) {
-          return false;
+        const apiKey = getAuthorizationApiKey(req);
+        if (apiKey !== self.options.apiKey) {
+          throw 'Invalid API key';
         }
-        return true;
-      });
-      for (const collection of collections) {
-        const criteria = (collection.collectionName === 'aposDocs') ? {
-          type: {
-            $nin: self.neverTypes
+        // Ask nginx not to buffer this large response, better that it
+        // flow continuously to the other end
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.write(JSON.stringify({
+          '@apostrophecms/sync-content': true,
+          version: 1
+        }));
+        const never = self.neverCollections;
+        const collections = (await self.apos.db.collections()).filter(collection => {
+          if (collection.collectionName.match(/^system\./)) {
+            return false;
           }
-        } : {};
-        await self.apos.migrations.each(collection, criteria, doc => {
-          return new Promise((resolve, reject) => {
-            const sent = res.write(EJSON.stringify({
-              collection: collection.collectionName,
-              doc
-            }));
-            if (sent) {
-              resolve();
-            } else {
-              // Keep draining when the buffer is full to avoid using too much RAM
-              res.once('drain', () => {
-                resolve();
-              });
-            }
-          });
+          if (never.includes(collection.collectionName)) {
+            return false;
+          }
+          return true;
         });
+        for (const collection of collections) {
+          const criteria = (collection.collectionName === 'aposDocs') ? {
+            type: {
+              $nin: self.neverTypes
+            }
+          } : {};
+          await self.apos.migrations.each(collection, criteria, doc => {
+            return new Promise((resolve, reject) => {
+              const sent = res.write(EJSON.stringify({
+                collection: collection.collectionName,
+                doc
+              }));
+              if (sent) {
+                resolve();
+              } else {
+                // Keep draining when the buffer is full to avoid using too much RAM
+                res.once('drain', () => {
+                  resolve();
+                });
+              }
+            });
+          });
+        }
+        res.write(JSON.stringify({
+          'end': true
+        }));
+        res.end();
+      } catch (e) {
+        self.apos.utils.error(e);
+        return res.status(400).send('invalid');
       }
-      res.write(JSON.stringify({
-        'end': true
-      }));
-      res.end();
     });
+
+    self.route('get', 'uploadfs', async (req, res) => {
+      const disable = util.promisify(self.apos.attachments.uploadfs.disable);
+      const enable = util.promisify(self.apos.attachments.uploadfs.enable);
+      const copyOut = util.promisify(self.apos.attachments.uploadfs.copyOut);
+      try {
+        self.checkAuthorizationApiKey(req);
+        const path = self.apos.launder.string(req.query.path);
+        const disabled = self.apos.launder.boolean(req.query.disabled);
+        if (!path.length) {
+          throw self.apos.error('invalid');
+        }
+        if (!disabled) {
+          return res.redirect(self.apos.attachments.uploadfs.getUrl(path));
+        } else {
+          const tempPath = self.getTempPath(path);
+          // This workaround is not ideal, in future uploadfs will provide
+          // better guarantees that copyOut works when direct URL access does not
+          await enable(path);
+          await copyOut(path, tempPath);
+          await disable(path);
+          res.on('finish', async () => {
+            await unlink(tempPath);
+          });
+          return res.download(tempPath);
+        }
+      } catch (e) {
+        self.apos.utils.error(e);
+        return res.status(400).send('invalid');
+      }
+    });
+
     // Returns promise (awaitable)
     self.syncFrom = async (envName) => {
       let ended = false;
-      const env = self.options.environments && self.options.environments[envName];
-      if (!env) {
-        throw new Error(`${envName} does not appear as a subproperty of the environments option`);
-      }
+      const env = self.getEnv(envName);
       const response = await fetch(`${env.url}/modules/@apostrophecms/sync-content/content`, {
         headers: {
           'Authorization': `ApiKey ${env.apiKey}`
@@ -105,6 +142,10 @@ module.exports = {
       let version = null;
       const collections = {};
       
+      // This solution with a custom writable stream appears to handle backpressure properly,
+      // several others appeared prettier but did not do that, so they would exhaust RAM
+      // on a large site
+
       const sink = new Stream.Writable({
         objectMode: true
       });
@@ -129,6 +170,8 @@ module.exports = {
       if (!ended) {
         throw 'Incomplete stream';
       }
+
+      await self.syncUploadfsFrom(envName);
 
       async function handleObject(value) {
         value = value.value;
@@ -174,174 +217,107 @@ module.exports = {
       }
     };
 
-      // return new Promise(async (resolve, reject) => {
+    self.syncUploadfsFrom = async (envName) => {
 
-      //   try {
-      //     let error = false;
+      const env = self.getEnv(envName);
 
-      //     output.on('close', function() {
-      //       if (!error) {
-      //         resolve();
-      //       }
-      //     });
-
-      //     const archive = archiver('zip', {});
-
-      //     archive.on('error', function(err) {
-      //       error = true;
-      //       return reject(err);
-      //     });
-
-      //     // pipe archive data to the file
-      //     archive.pipe(output);
-
-
-
-      //     const copyOut = util.promisify(self.apos.attachments.uploadfs.copyOut);
-      //     await self.apos.migrations.each(self.apos.attachments.db, {}, 5, async (attachment) => {
-      //       if (error) {
-      //         // Ignore the rest once we hit an error
-      //         return;
-      //       }
-      //       const files = [];
-      //       files.push(self.apos.attachments.url(attachment, {
-      //         size: 'original',
-      //         uploadfsPath: true
-      //       }));
-      //       for (const size of self.apos.attachments.imageSizes) {
-      //         files.push(self.apos.attachments.url(attachment, {
-      //           size: size.name,
-      //           uploadfsPath: true
-      //         }));
-      //       }
-      //       for (const crop of (attachment.crops || [])) {
-      //         files.push(self.apos.attachments.url(attachment, {
-      //           crop: crop,
-      //           size: 'original',
-      //           uploadfsPath: true
-      //         }));
-      //         for (const size of self.apos.attachments.imageSizes) {
-      //           files.push(self.apos.attachments.url(attachment, {
-      //             crop: crop,
-      //             size: size.name,
-      //             uploadfsPath: true
-      //           }));
-      //         }
-      //       }
-      //       for (const file of files) {
-      //         if (error) {
-      //           break;
-      //         }
-      //         const tempPath = self.getTempPath(file);
-      //         try {
-      //           await copyOut(file, tempPath);
-      //           await add(tempPath);
-      //           function add() {
-      //             console.log(`** ${file}`);
-      //             return new Promise((resolve, reject) => {
-      //               if (fs.existsSync(tempPath)) {
-      //                 const fileIn = fs.createReadStream(tempPath);
-      //                 let closed = false;
-      //                 fileIn.on('close', async () => {
-      //                   if (!closed) {
-      //                     closed = true;
-      //                     try {
-      //                       await unlink(tempPath);
-      //                     } catch (e) {
-      //                       return reject(e);
-      //                     }
-      //                     return resolve();
-      //                   }
-      //                 });
-      //                 // TODO is there a way to avoid inefficient double zip encoding
-      //                 // of compressed file types like GIF/JPG/PNG?
-      //                 archive.append(fileIn, {
-      //                   name: `uploads/${file}`
-      //                 });
-      //               } else {
-      //                 self.apos.util.error(`Unable to copy ${file} out to ${tempPath}, probably does not exist, continuing`);
-      //               }
-      //             });
-      //           }
-      //         } finally {
-      //           if (fs.existsSync(tempPath)) {
-      //             await unlink(tempPath);
-      //           }
-      //         }
-      //       }
-      //     });
-      //     console.log('** finalizing');
-      //     archive.finalize();
-      //   } catch (e) {
-      //     reject(e);
-      //   }
-      // });
-
-      // Returns promise (awaitable)
-    // self.restore = (input, { drop }) => {
-    //   return new Promise(async (resolve, reject) => {
-    //     if (drop) {
-    //       const never = [ 'aposUsersSafe' ];
-    //       const collections = (await self.apos.db.collections()).filter(collection => !collection.collectionName.match(/^system\./) && !never.includes(collection.collectionName));
-    //       for (const collection of collections) {
-    //         console.log(`** ${collection.collectionName}`);
-    //         const criteria = (collection.collectionName === 'aposDocs') ? {
-    //           type: {
-    //             $nin: [ 'apostrophe-users', 'apostrophe-groups' ]
-    //           }
-    //         } : {};
-    //         await collection.removeMany(criteria);
-    //       }          
-    //     }
-    //     const copyIn = util.promisify(self.apos.attachments.uploadfs.copyIn);
-    //     const collections = {};
-    //     let error = false;
-    //     input.pipe(unzipper.Parse())
-    //     .on('entry', async (entry) => {
-    //       const filename = entry.path;
-    //       console.log(`** ${entry.path}`);
-    //       if (entry.type !== 'File') {
-    //         return;
-    //       }
-    //       if (filename.startsWith('db/')) {
-    //         const collectionName = filename.substring(3);
-    //         if (!collectionName.match(/\w/)) {
-    //           throw new Error('Collection names must contain only letters, digits and underscores');
-    //         }
-    //         if (!collection[collectionName]) {
-    //           collection[collectionName] = self.apos.db.collection(collectionName);
-    //         }
-    //         const parsed = EJSON.parse(await entry.buffer());
-    //         await collection.replaceOne({
-    //           _id: parsed._id
-    //         }, parsed, {
-    //           upsert: true
-    //         });
-    //       } else if (filename.startsWith('uploads/')) {
-    //         const uploadfsPath = filename.substring('uploads/'.length);
-    //         const tempPath = self.getTempPath(uploadfsPath);
-    //         const output = fs.createWriteStream(tempPath);
-    //         await pipe(entry, output);
-    //         await copyIn(tempPath, uploadfsPath);          
-    //       } else {
-    //         self.apos.util.warn(`Warning: unexpected file path: ${filename}`);
-    //         entry.autodrain();
-    //       }
-    //     })
-    //     .on('close', () => {
-    //       if (!error) {
-    //         resolve();
-    //       }
-    //     })
-    //     .on('error', (e) => {
-    //       error = true;
-    //       return reject(e);
-    //     });
-    //   });
-    // };
+      const disable = util.promisify(self.apos.attachments.uploadfs.disable);
+      const remove = util.promisify(self.apos.attachments.uploadfs.remove);
+      const copyIn = util.promisify(self.apos.attachments.uploadfs.copyIn);
+      await self.apos.migrations.each(self.apos.attachments.db, {}, 5, async (attachment) => {
+        const files = [];
+        push(attachment, 'original', null);
+        for (const size of self.apos.attachments.imageSizes) {
+          push(attachment, size.name, null);
+        }
+        for (const crop of (attachment.crops || [])) {
+          push(attachment, 'original', crop);
+          for (const size of self.apos.attachments.imageSizes) {
+            push(attachment, size.name, crop);
+          }
+        }
+        for (const file of files) {
+          const tempPath = self.getTempPath(file.path);
+          await attempt(false);
+          async function attempt(retryingDisabled) {
+            try {
+              const params = qs.stringify({
+                ...file,
+                disabled: retryingDisabled ? !file.disabled : file.disabled
+              });
+              const response = await fetch(`${env.url}/modules/@apostrophecms/sync-content/uploadfs?${params}`, {
+                headers: {
+                  'Authorization': `ApiKey ${env.apiKey}`
+                }
+              });
+              if (response.status !== 200) {
+                throw response.status;
+              }
+              await pipeline(
+                response.body,
+                fs.createWriteStream(tempPath)
+              );
+              try {
+                await remove(file.path);
+              } catch (e) {
+                // Nonfatal, we are just making sure we don't get into conflict
+                // with previous permissions settings if the receiving site
+                // did have this file
+              }
+              await copyIn(tempPath, file.path);
+              if (file.disabled) {
+                await disable(file.path);
+              }
+            } catch (e) {
+              if (!retryingDisabled) {
+                // Work around the fact that the disabled state of the file
+                // sometimes does not match what is expected on the sending end,
+                // possibly due to an A2 bug. This way the receiving end gets
+                // to the right outcome either way
+                return await attempt(true);
+              }
+              // Missing attachments are not unusual and should not flunk the entire process
+              self.apos.utils.error(`Error fetching uploadfs path ${file.path}, continuing:`);
+              self.apos.utils.error(e);    
+            } finally {
+              if (fs.existsSync(tempPath)) {
+                await unlink(tempPath);
+              }
+            }
+          }
+        }
+        function push(attachment, size, crop) {
+          files.push({
+            path: self.apos.attachments.url(attachment, {
+              size,
+              uploadfsPath: true,
+              crop
+            }),
+            disabled: attachment.trash && (size !== self.apos.attachments.sizeAvailableInTrash)
+          });
+        }
+      });
+    };
 
     self.getTempPath = (file) => {
       return self.apos.attachments.uploadfs.getTempPath() + '/' + self.apos.utils.generateId() + require('path').extname(file);
+    };
+
+    self.getEnv = (envName) => {
+      const env = self.options.environments && self.options.environments[envName];
+      if (!env) {
+        throw new Error(`${envName} does not appear as a subproperty of the environments option`);
+      }
+      return env;
+    };
+    self.checkAuthorizationApiKey = (req) => {
+      if (!self.options.apiKey) {
+        throw 'API key not configured';
+      }
+      const apiKey = getAuthorizationApiKey(req);
+      if (apiKey !== self.options.apiKey) {
+        throw 'Invalid API key';
+      }
     };
   }
 };
