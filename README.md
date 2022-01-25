@@ -75,12 +75,12 @@ node app @apostrophecms/sync-content:sync --to=staging
 node app @apostrophecms/sync-content:sync --from=staging
 # sync content of one piece type only, plus any related
 # documents. If other content already exists locally, purge it
-node app @apostrophecms/sync-content:sync --from=staging --type=articles
+node app @apostrophecms/sync-content:sync --from=staging --type=article
 # Same, but keep other content of this type
-node app @apostrophecms/sync-content:sync --from=staging --type=articles --keep
+node app @apostrophecms/sync-content:sync --from=staging --type=article --keep
 # sync content of one piece type only, without related documents
 # (may also be combined with --keep)
-node app @apostrophecms/sync-content:sync --from=staging --type=articles --without-related
+node app @apostrophecms/sync-content:sync --from=staging --type=article --related=false
 # skip media, for speed (you will see broken images)
 node app @apostrophecms/sync-content:sync --from=staging --skip-media
 ```
@@ -88,7 +88,7 @@ node app @apostrophecms/sync-content:sync --from=staging --skip-media
 * You must specify either `--from` or `--to` to specify the environment to sync with, as seen in your configuration above, where `staging` is an example.
 * You may specify `--type=typename` to specify one content type only. This must be a piece type, and must match the `name` option of the type (**not** the module name, unless they are the same).
 * When using `--type`, you may also specify `--keep` to keep preexisting pieces whose `_id` does not appear in the synced content. **For data integrity reasons, this is not available when syncing an entire site.**
-* By default, syncing a piece type will also sync directly related documents, such as images found in that piece. If you do not want this, specify `--without-related`.
+* By default, syncing a piece type will also sync directly related documents, such as images found in that piece. If you do not want this, specify `--related=false`.
 * Actual media files, i.e. images, PDFs, etc., are always synced when using the UI. However on the command line you can skip this with `--skip-media`. **This will definitely result in broken images,** but is useful for quick tests.
 
 ### Security restrictions

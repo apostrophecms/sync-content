@@ -14,6 +14,7 @@ const qs = require('qs');
 
 module.exports = {
   construct(self, options) {
+    require('./lib/findJoins')(self, options);
     self.neverCollections = [ 'aposUsersSafe', 'sessions', 'aposCache', 'aposLocks', 'aposNotifications', 'aposBlessings', 'aposDocVersions' ];
     self.neverTypes = [ 'apostrophe-user', 'apostrophe-group' ];
     self.apos.on('csrfExceptions', function(list) {
@@ -29,8 +30,19 @@ module.exports = {
       if (argv.from && argv.to) {
         throw 'You must not specify both --from and --to (one end is always local).';
       }
+      if (argv.type) {
+        argv.related = self.apos.launder.boolean(argv.related, true);
+        argv.keep = self.apos.launder.boolean(argv.keep);
+      } else {
+        if (argv.related) {
+          throw '--related not available without --type';
+        }
+        if (argv.keep) {
+          throw '--keep not available without --type';
+        }
+      }
       if (argv.from) {
-        await self.syncFrom(argv.from);
+        await self.syncFrom(argv.from, argv);
       } else {
         await self.syncTo(argv.to);
       }
@@ -46,6 +58,13 @@ module.exports = {
         if (apiKey !== self.options.apiKey) {
           throw 'Invalid API key';
         }
+        const type = self.apos.launder.string(req.query.type);
+        const related = self.apos.launder.boolean(req.query.related);
+        if (!type) {
+          if (related) {
+            throw 'related is only permitted with type';
+          }
+        }
         // Ask nginx not to buffer this large response, better that it
         // flow continuously to the other end
         res.setHeader('X-Accel-Buffering', 'no');
@@ -54,7 +73,8 @@ module.exports = {
           version: 1
         }));
         const never = self.neverCollections;
-        const collections = (await self.apos.db.collections()).filter(collection => {
+        const docs = self.getCollection('aposDocs');
+        const collections = type ? [ docs ] : (await self.apos.db.collections()).filter(collection => {
           if (collection.collectionName.match(/^system\./)) {
             return false;
           }
@@ -63,28 +83,88 @@ module.exports = {
           }
           return true;
         });
+        let attachmentIds = [];
         for (const collection of collections) {
-          const criteria = (collection.collectionName === 'aposDocs') ? {
+          await handleCollection(collection);
+        }
+        if (attachmentIds.length) {
+          await handleCollection(self.getCollection('aposAttachments'), attachmentIds);
+        }
+        async function handleCollection(collection, ids) {
+          const criteria = ids ? {
+            _id: {
+              $in: ids
+            }
+          } : type ? {
+            type
+          } : (collection.collectionName === 'aposDocs') ? {
             type: {
               $nin: self.neverTypes
             }
           } : {};
           await self.apos.migrations.each(collection, criteria, doc => {
-            return new Promise((resolve, reject) => {
-              const sent = res.write(EJSON.stringify({
-                collection: collection.collectionName,
-                doc
-              }));
-              if (sent) {
-                resolve();
-              } else {
-                // Keep draining when the buffer is full to avoid using too much RAM
-                res.once('drain', () => {
-                  resolve();
-                });
+            return new Promise(async (resolve, reject) => {
+              try {
+                // "sent" keeps track of whether we have started to buffer
+                // output in RAM, if we have then after this batch we'll
+                // wait for the output to drain
+                let sent = write(doc);
+                if (type) {
+                  attachmentIds = attachmentIds.concat(self.apos.attachments.all(doc).map(attachment => attachment._id));
+                }
+                if (related && (collection.collectionName === 'aposDocs')) {
+                  const joins = self.findJoinsInDoc(doc);
+                  let ids = [];
+                  for (const join of joins) {
+                    const id = join.field.idField && join.doc[join.field.idField];
+                    if (id) {
+                      ids.push(id);
+                    }
+                    const joinIds = join.field.idsField && join.doc[join.field.idsField];
+                    if (joinIds) {
+                      ids = ids.concat(joinIds);
+                    }
+                  }
+                  const relatedDocs = await collection.find({
+                    _id: {
+                      $in: ids
+                    },
+                    type: {
+                      $nin: self.neverTypes
+                    },
+                    // Pages are never considered related for this purpose
+                    // because it leads to data integrity issues
+                    slug: /^[^\/]/
+                  }).toArray();
+                  for (const relatedDoc of relatedDocs) {
+                    if (type) {
+                      attachmentIds = attachmentIds.concat(self.apos.attachments.all(relatedDoc).map(attachment => attachment._id));
+                    }
+                    // Careful, make sure the write happens anyway before
+                    // using &&, short-circuit evaluation could otherwise
+                    // prevent the write call from executing
+                    sent = write(relatedDoc) && sent;
+                  }
+                }
+                if (sent) {
+                  return resolve();
+                } else {
+                  // Keep draining when the buffer is full to avoid using too much RAM
+                  res.once('drain', () => {
+                    return resolve();
+                  });
+                }
+              } catch (e) {
+                return reject(e);
               }
             });
           });
+          function write(doc) {
+            return res.write(EJSON.stringify({
+              collection: collection.collectionName,
+              doc
+            }));       
+          }
         }
         res.write(JSON.stringify({
           'end': true
@@ -127,11 +207,24 @@ module.exports = {
       }
     });
 
-    // Returns promise (awaitable)
-    self.syncFrom = async (envName) => {
+    self.syncFrom = async (envName, options) => {
+      const updatePermissions = util.promisify(self.apos.attachments.updatePermissions);
       let ended = false;
       const env = self.getEnv(envName);
-      const response = await fetch(`${env.url}/modules/@apostrophecms/sync-content/content`, {
+      if (!options.type) {
+        if (options.keep) {
+          throw 'keep option not available without type option';
+        }
+        if (options.related) {
+          throw 'related option not available without type option';
+        }
+      }
+      const query = qs.stringify({
+        type: options.type,
+        keep: !!options.keep,
+        related: !!options.related
+      });
+      const response = await fetch(`${env.url}/modules/@apostrophecms/sync-content/content?${query}`, {
         headers: {
           'Authorization': `ApiKey ${env.apiKey}`
         }
@@ -141,6 +234,7 @@ module.exports = {
       }
       let version = null;
       const collections = {};
+      let docIds = [];
       
       // This solution with a custom writable stream appears to handle backpressure properly,
       // several others appeared prettier but did not do that, so they would exhaust RAM
@@ -172,6 +266,8 @@ module.exports = {
       }
 
       await self.syncUploadfsFrom(envName);
+      // Fix attachment permissions once all the facts are in
+      await updatePermissions();
 
       async function handleObject(value) {
         value = value.value;
@@ -185,25 +281,47 @@ module.exports = {
           version = value.version;
           const never = self.neverCollections;
           // Purge
-          const collections = (await self.apos.db.collections()).filter(collection => !collection.collectionName.match(/^system\./) && !never.includes(collection.collectionName));
-          for (const collection of collections) {
-            const criteria = (collection.collectionName === 'aposDocs') ? {
-              type: {
-                $nin: self.neverTypes
-              }
-            } : {};
-            await collection.removeMany(criteria);
+          if (!options.type) {
+            const collections = (await self.apos.db.collections()).filter(collection => !collection.collectionName.match(/^system\./) && !never.includes(collection.collectionName));
+            for (const collection of collections) {
+              const criteria = (collection.collectionName === 'aposDocs') ? {
+                type: {
+                  $nin: self.neverTypes
+                }
+              } : {};
+              await collection.removeMany(criteria);
+            }
+          } else if (!options.keep) {
+            // TODO attachments need to update their references when this happens
+            await self.apos.docs.db.removeMany({
+              type: options.type
+            });
           }
         } else if (value.collection) {
           if (!collections[value.collection]) {
-            collections[value.collection] = self.apos.db.collection(value.collection);
+            collections[value.collection] = self.getCollection(value.collection);
           }
           const collection = collections[value.collection];
           try {
             value.doc = EJSON.parse(JSON.stringify(value.doc));
-            await collection.insertOne(
-              value.doc
-            );
+            if (value.collection === 'aposDocs') {
+              docIds.push(value.doc._id);
+            }
+            if ((value.collection === 'aposAttachments') && options.type) {
+              await self.mergeAttachment(value.doc, docIds);
+            } else if (options.keep) {
+              await collection.replaceOne(
+                {
+                  _id: value.doc._id
+                },
+                value.doc,
+                {
+                  upsert: true
+                }
+              );
+            } else {
+              await collection.insertOne(value.doc);
+            }
           } catch (e) {
             console.error(JSON.stringify(value, null, '  '));
             throw e;
@@ -211,10 +329,33 @@ module.exports = {
         } else if (value.end) {
           ended = true;
         } else {
+          console.error(value);
           throw 'Unexpected object in JSON stream';
         }
         return true;
       }
+    };
+
+    self.mergeAttachment = async (attachment, docIds) => {
+      // Merge what the sending and receiving sites know about docIds and trashDocIds to
+      // ensure updatePermissions does the right thing for this attachment
+      const existing = await self.apos.attachments.db.findOne({
+        _id: attachment._id
+      });
+      const newDocIds = attachment.docIds.filter(id => docIds.includes(id));
+      const newTrashDocIds = attachment.trashDocIds.filter(id => docIds.includes(id));
+      if (!existing) {
+        attachment.docIds = newDocIds;
+        attachment.trashDocIds = newTrashDocIds;
+        return self.apos.attachments.db.insertOne(attachment);
+      }
+      const oldDocIds = existing.docIds.filter(id => !docIds.includes(id));
+      const oldTrashDocIds = attachment.trashDocIds.filter(id => !docIds.includes(id));
+      attachment.docIds = newDocIds.concat(oldDocIds);
+      attachment.trashDocIds = newTrashDocIds.concat(oldTrashDocIds);
+      await self.apos.attachments.db.replaceOne({
+        _id: attachment._id
+      }, attachment);
     };
 
     self.syncUploadfsFrom = async (envName) => {
@@ -318,6 +459,14 @@ module.exports = {
       if (apiKey !== self.options.apiKey) {
         throw 'Invalid API key';
       }
+    };
+    self.getCollection = (name) => {
+      const collection = self.apos.db.collection(name);
+      // Should not be necessary according to the mongodb docs, but when
+      // this method is used to obtain a collection object we don't get
+      // a collectionName property
+      collection.collectionName = name;
+      return collection;
     };
   }
 };

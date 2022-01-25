@@ -23,6 +23,7 @@
   "dependencies": {
     "bson": "^4.6.1",
     "compression": "^1.7.4",
+    "lodash": "^4.17.21",
     "node-fetch": "^2.6.7",
     "qs": "^6.10.3",
     "stream-json": "^1.7.3",
