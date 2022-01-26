@@ -1,8 +1,6 @@
 const fs = require('fs');
 const { EJSON } = require('bson');
 const util = require('util');
-const archiver = require('archiver');
-const unzipper = require('unzipper');
 const unlink = util.promisify(fs.unlink);
 const fetch = require('node-fetch');
 const compression = require('compression');
