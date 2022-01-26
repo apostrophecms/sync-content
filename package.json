@@ -1,6 +1,6 @@
 {
   "name": "@apostrophecms/sync-content",
-  "version": "1.0.0",
+  "version": "1.0.0-alpha",
   "description": "Content sync utility for ApostropheCMS sites",
   "main": "index.js",
   "scripts": {
