@@ -33,6 +33,7 @@ module.exports = {
       if (argv.type) {
         argv.related = self.apos.launder.boolean(argv.related, true);
         argv.keep = self.apos.launder.boolean(argv.keep);
+        argv.query = qs.parse(self.apos.launder.string(argv.query));
       } else {
         if (argv.related) {
           throw '--related not available without --type';
@@ -40,11 +41,15 @@ module.exports = {
         if (argv.keep) {
           throw '--keep not available without --type';
         }
+        if (argv.query) {
+          throw '--query not available without --type';
+        }
       }
       if (argv.from) {
-        await self.syncFrom(argv.from, argv);
+        const env = self.getEnv(argv.from, argv);
+        await self.syncFrom(env, argv);
       } else {
-        await self.syncTo(argv.to);
+        throw '--to is not yet implemented';
       }
     });
     self.route('get', 'content', compression({
@@ -60,9 +65,16 @@ module.exports = {
         }
         const type = self.apos.launder.string(req.query.type);
         const related = self.apos.launder.boolean(req.query.related);
+        // Naming it req.query.workflowLocale causes it to be stolen by
+        // the workflow module, so we don't do that
+        const workflowLocale = self.apos.launder.string(req.query.locale);
+        const query = (typeof req.query.query === 'object') ? req.query.query : null;
         if (!type) {
           if (related) {
             throw 'related is only permitted with type';
+          }
+          if (query) {
+            throw 'query is only permitted with type';
           }
         }
         // Ask nginx not to buffer this large response, better that it
@@ -91,6 +103,19 @@ module.exports = {
           await handleCollection(self.getCollection('aposAttachments'), attachmentIds);
         }
         async function handleCollection(collection, ids) {
+          const seen = new Set();
+          if (query && (collection.collectionName === 'aposDocs') && !ids) {
+            const manager = self.apos.docs.getManager(type);
+            const reqParams = {};
+            if (workflowLocale) {
+              reqParams.locale = workflowLocale;
+            }
+            const criteria = {};
+            ids = (await manager.find(self.apos.tasks.getReq(reqParams), {}, { _id: 1 })
+              .queryToFilters(query, 'manage')
+              .toArray())
+              .map(doc => doc._id);
+          }
           const criteria = ids ? {
             _id: {
               $in: ids
@@ -102,68 +127,77 @@ module.exports = {
               $nin: self.neverTypes
             }
           } : {};
-          await self.apos.migrations.each(collection, criteria, doc => {
-            return new Promise(async (resolve, reject) => {
-              try {
-                // "sent" keeps track of whether we have started to buffer
-                // output in RAM, if we have then after this batch we'll
-                // wait for the output to drain
-                let sent = write(doc);
+          if ((collection.collectionName === 'aposDocs') && workflowLocale) {
+            criteria.workflowLocale = {
+              $in: [ null, workflowLocale ]
+            };
+          }
+          await self.apos.migrations.each(collection, criteria, async (doc) => {
+            // "sent" keeps track of whether we have started to buffer
+            // output in RAM, if we have then after this batch we'll
+            // wait for the output to drain
+            await write(doc);
+            if (type && (collection.collectionName === 'aposDocs')) {
+              attachmentIds = attachmentIds.concat(self.apos.attachments.all(doc).map(attachment => attachment._id));
+            }
+            if (related && (collection.collectionName === 'aposDocs')) {
+              const joins = self.findJoinsInDoc(doc);
+              let ids = [];
+              for (const join of joins) {
+                const id = join.field.idField && join.doc[join.field.idField];
+                if (id) {
+                  ids.push(id);
+                }
+                const joinIds = join.field.idsField && join.doc[join.field.idsField];
+                if (joinIds) {
+                  ids = ids.concat(joinIds);
+                }
+              }
+              const relatedDocs = await collection.find({
+                _id: {
+                  $in: ids
+                },
+                type: {
+                  $nin: self.neverTypes
+                },
+                // Pages are never considered related for this purpose
+                // because it leads to data integrity issues
+                slug: /^[^\/]/
+              }).toArray();
+              for (const relatedDoc of relatedDocs) {
                 if (type) {
-                  attachmentIds = attachmentIds.concat(self.apos.attachments.all(doc).map(attachment => attachment._id));
+                  attachmentIds = attachmentIds.concat(self.apos.attachments.all(relatedDoc).map(attachment => attachment._id));
                 }
-                if (related && (collection.collectionName === 'aposDocs')) {
-                  const joins = self.findJoinsInDoc(doc);
-                  let ids = [];
-                  for (const join of joins) {
-                    const id = join.field.idField && join.doc[join.field.idField];
-                    if (id) {
-                      ids.push(id);
-                    }
-                    const joinIds = join.field.idsField && join.doc[join.field.idsField];
-                    if (joinIds) {
-                      ids = ids.concat(joinIds);
-                    }
-                  }
-                  const relatedDocs = await collection.find({
-                    _id: {
-                      $in: ids
-                    },
-                    type: {
-                      $nin: self.neverTypes
-                    },
-                    // Pages are never considered related for this purpose
-                    // because it leads to data integrity issues
-                    slug: /^[^\/]/
-                  }).toArray();
-                  for (const relatedDoc of relatedDocs) {
-                    if (type) {
-                      attachmentIds = attachmentIds.concat(self.apos.attachments.all(relatedDoc).map(attachment => attachment._id));
-                    }
-                    // Careful, make sure the write happens anyway before
-                    // using &&, short-circuit evaluation could otherwise
-                    // prevent the write call from executing
-                    sent = write(relatedDoc) && sent;
-                  }
-                }
-                if (sent) {
-                  return resolve();
-                } else {
-                  // Keep draining when the buffer is full to avoid using too much RAM
+                await write(relatedDoc);
+              }
+            }
+          });
+          async function write(doc) {
+            if (seen.has(doc._id)) {
+              // Don't send a related doc twice
+              return;
+            }
+            seen.add(doc._id);
+            return new Promise((resolve, reject) => {
+              try {
+                const result = res.write(EJSON.stringify({
+                  collection: collection.collectionName,
+                  doc
+                }));
+                if (!result) {
+                  // Node streams backpressure is fussy, you don't get a
+                  // drain event for the second of two consecutive false returns,
+                  // we must wait every time we do get one
                   res.once('drain', () => {
                     return resolve();
                   });
+                } else {
+                  return resolve();
                 }
               } catch (e) {
                 return reject(e);
               }
             });
-          });
-          function write(doc) {
-            return res.write(EJSON.stringify({
-              collection: collection.collectionName,
-              doc
-            }));       
           }
         }
         res.write(JSON.stringify({
@@ -188,7 +222,11 @@ module.exports = {
           throw self.apos.error('invalid');
         }
         if (!disabled) {
-          return res.redirect(self.apos.attachments.uploadfs.getUrl(path));
+          let url = self.apos.attachments.uploadfs.getUrl() + path;
+          if (url.startsWith('/') && !url.startsWith('//') && req.baseUrl) {
+            url = req.baseUrl + url;
+          }
+          return res.redirect(url);
         } else {
           const tempPath = self.getTempPath(path);
           // This workaround is not ideal, in future uploadfs will provide
@@ -207,10 +245,9 @@ module.exports = {
       }
     });
 
-    self.syncFrom = async (envName, options) => {
+    self.syncFrom = async (env, options) => {
       const updatePermissions = util.promisify(self.apos.attachments.updatePermissions);
       let ended = false;
-      const env = self.getEnv(envName);
       if (!options.type) {
         if (options.keep) {
           throw 'keep option not available without type option';
@@ -222,7 +259,11 @@ module.exports = {
       const query = qs.stringify({
         type: options.type,
         keep: !!options.keep,
-        related: !!options.related
+        related: !!options.related,
+        // We have to rename this one in the query string to work around
+        // the fact that the workflow module steals it otherwise
+        locale: options.workflowLocale,
+        query: options.query
       });
       const response = await fetch(`${env.url}/modules/@apostrophecms/sync-content/content?${query}`, {
         headers: {
@@ -243,6 +284,7 @@ module.exports = {
       const sink = new Stream.Writable({
         objectMode: true
       });
+      let attachmentIds = [];
       sink._write = async (value, encoding, callback) => {
         try {
           await handleObject(value);
@@ -265,7 +307,7 @@ module.exports = {
         throw 'Incomplete stream';
       }
 
-      await self.syncUploadfsFrom(envName);
+      await self.syncUploadfsFrom(env, { attachmentIds });
       // Fix attachment permissions once all the facts are in
       await updatePermissions();
 
@@ -309,18 +351,33 @@ module.exports = {
             }
             if ((value.collection === 'aposAttachments') && options.type) {
               await self.mergeAttachment(value.doc, docIds);
-            } else if (options.keep) {
-              await collection.replaceOne(
-                {
-                  _id: value.doc._id
-                },
-                value.doc,
-                {
-                  upsert: true
-                }
-              );
+              attachmentIds.push(value.doc._id);
             } else {
-              await collection.insertOne(value.doc);
+              for (let attempt = 0; (attempt < 10); attempt++) {
+                try {
+                  if (options.keep) {
+                    await collection.replaceOne(
+                      {
+                        _id: value.doc._id
+                      },
+                      value.doc,
+                      {
+                        upsert: true
+                      }
+                    );
+                  } else {
+                    await collection.insertOne(value.doc);
+                  }
+                } catch (e) {
+                  if ((collection.collectionName === 'aposDocs') && self.apos.docs.isUniqueError(e)) {
+                    value.doc.slug += Math.floor(Math.random() * 10);
+                    continue;
+                  } else {
+                    throw e;
+                  }
+                }
+                break;
+              }
             }
           } catch (e) {
             console.error(JSON.stringify(value, null, '  '));
@@ -358,14 +415,17 @@ module.exports = {
       }, attachment);
     };
 
-    self.syncUploadfsFrom = async (envName) => {
-
-      const env = self.getEnv(envName);
+    self.syncUploadfsFrom = async (env, { attachmentIds }) => {
 
       const disable = util.promisify(self.apos.attachments.uploadfs.disable);
       const remove = util.promisify(self.apos.attachments.uploadfs.remove);
       const copyIn = util.promisify(self.apos.attachments.uploadfs.copyIn);
-      await self.apos.migrations.each(self.apos.attachments.db, {}, 5, async (attachment) => {
+      const criteria = attachmentIds ? {
+        _id: {
+          $in: attachmentIds
+        }
+      } : {};
+      await self.apos.migrations.each(self.apos.attachments.db, criteria, 5, async (attachment) => {
         const files = [];
         push(attachment, 'original', null);
         for (const size of self.apos.attachments.imageSizes) {
@@ -444,7 +504,18 @@ module.exports = {
       return self.apos.attachments.uploadfs.getTempPath() + '/' + self.apos.utils.generateId() + require('path').extname(file);
     };
 
-    self.getEnv = (envName) => {
+    self.getEnv = (envName, argv) => {
+      if (envName.match(/^https?:/)) {
+        if (!argv['api-key']) {
+          throw '--api-key is required if --from specifies a URL';
+        }
+        return {
+          label: envName,
+          url: envName,
+          apiKey: argv['api-key']
+        };
+      }
+
       const env = self.options.environments && self.options.environments[envName];
       if (!env) {
         throw new Error(`${envName} does not appear as a subproperty of the environments option`);
