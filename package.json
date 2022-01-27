@@ -27,5 +27,8 @@
     "node-fetch": "^2.6.7",
     "qs": "^6.10.3",
     "stream-json": "^1.7.3"
+  },
+  "peerDependencies": {
+    "apostrophe": "^2.220.8"
   }
 }

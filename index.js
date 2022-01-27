@@ -46,8 +46,10 @@ module.exports = {
       if (argv.from) {
         const env = self.getEnv(argv.from, argv);
         await self.syncFrom(env, argv);
-      } else {
+      } else if (argv.to) {
         throw '--to is not yet implemented';
+      } else {
+        throw '--from is required';
       }
     });
     self.route('get', 'content', compression({
@@ -118,7 +120,7 @@ module.exports = {
             _id: {
               $in: ids
             }
-          } : type ? {
+          } : ((collection.collectionName === 'aposDocs') && type) ? {
             type
           } : (collection.collectionName === 'aposDocs') ? {
             type: {
@@ -418,7 +420,7 @@ module.exports = {
       const disable = util.promisify(self.apos.attachments.uploadfs.disable);
       const remove = util.promisify(self.apos.attachments.uploadfs.remove);
       const copyIn = util.promisify(self.apos.attachments.uploadfs.copyIn);
-      const criteria = attachmentIds ? {
+      const criteria = (options.type && attachmentIds) ? {
         _id: {
           $in: attachmentIds
         }
