@@ -219,7 +219,7 @@ module.exports = {
         const path = self.apos.launder.string(req.query.path);
         const disabled = self.apos.launder.boolean(req.query.disabled);
         if (!path.length) {
-          throw self.apos.error('invalid');
+          throw self.apos.utils.error('invalid');
         }
         if (!disabled) {
           let url = self.apos.attachments.uploadfs.getUrl() + path;
