@@ -1,6 +1,3 @@
-[![CircleCI](https://circleci.com/gh/apostrophecms/sync-content/tree/master.svg?style=svg)](https://circleci.com/gh/apostrophecms/sync-content/tree/master)
-[![Chat on Discord](https://img.shields.io/discord/517772094482677790.svg)](https://chat.apostrophecms.org)
-
 <p align="center">
   <a href="https://github.com/apostrophecms/apostrophe">
     <!-- TODO:  -->
