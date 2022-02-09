@@ -246,6 +246,9 @@ module.exports = {
     });
 
     self.syncFrom = async (env, options) => {
+      if (env.url.endsWith('/')) {
+        throw 'URL for environment must not end with /, should be a base URL for the site';
+      }
       const updatePermissions = util.promisify(self.apos.attachments.updatePermissions);
       let ended = false;
       if (!options.type) {
@@ -367,6 +370,32 @@ module.exports = {
                     );
                   } else {
                     await collection.insertOne(value.doc);
+                  }
+                  // This is A2, so when only one locale is synced
+                  // we must always match draft with live or vice versa
+                  if (query.locale && value.doc.workflowGuid) {
+                    const isDraft = query.locale.includes('-draft');
+                    const peerLocale = query.locale.includes('-draft') ? query.locale.replace('-draft', '') : (query.locale + '-draft');
+                    const existing = await collections.findOne({
+                      workflowGuid: value.doc.workflowGuid,
+                      workflowLocale: peerLocale
+                    });
+                    if (existing) {
+                      await collections.replaceOne({
+                        workflowGuid: value.doc.workflowGuid,
+                        workflowLocale: peerLocale
+                      }, {
+                        ...value.doc,
+                        workflowLocale: value.doc.workflowLocale,
+                        _id: existing._id
+                      });
+                    } else {
+                      await collections.insertOne({
+                        ...value.doc,
+                        workflowLocale: value.doc.workflowLocale,
+                        _id: self.apos.utils.generateId()
+                      });
+                    }
                   }
                 } catch (e) {
                   if ((collection.collectionName === 'aposDocs') && self.apos.docs.isUniqueError(e)) {
