@@ -375,7 +375,7 @@ module.exports = {
                   // we must always match draft with live or vice versa
                   if (query.locale && value.doc.workflowGuid) {
                     const isDraft = query.locale.includes('-draft');
-                    const peerLocale = query.locale.includes('-draft') ? query.locale.replace('-draft', '') : (query.locale + '-draft');
+                    const peerLocale = isDraft ? query.locale.replace('-draft', '') : (query.locale + '-draft');
                     const existing = await collections.findOne({
                       workflowGuid: value.doc.workflowGuid,
                       workflowLocale: peerLocale
@@ -386,14 +386,14 @@ module.exports = {
                         workflowLocale: peerLocale
                       }, {
                         ...value.doc,
-                        workflowLocale: value.doc.workflowLocale,
-                        _id: existing._id
+                        _id: existing._id,
+                        workflowLocale: value.doc.workflowLocale
                       });
                     } else {
                       await collections.insertOne({
                         ...value.doc,
-                        workflowLocale: value.doc.workflowLocale,
-                        _id: self.apos.utils.generateId()
+                        _id: self.apos.utils.generateId(),
+                        workflowLocale: value.doc.workflowLocale
                       });
                     }
                   }
